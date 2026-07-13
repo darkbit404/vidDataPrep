@@ -1,0 +1,18 @@
+# Virtual Environment
+.vidDataPrep/
+
+# Python
+__pycache__/
+*.pyc
+
+# Data
+data/
+data_frames/
+
+# Local config
+.env
+
+# Security
+credentials.json
+token.json
+
