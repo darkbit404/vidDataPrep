@@ -1,6 +1,8 @@
-opencv-python-headless==5.0.0.93
+opencv-python==5.0.0.93
 numpy==2.5.1
+screeninfo==0.8.1
 google-api-python-client==2.198.0
 google-auth-httplib2==0.4.0
 google-auth-oauthlib==1.4.0
 python-dotenv==1.2.2
+ultralytics==8.4.107

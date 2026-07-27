@@ -1,11 +1,8 @@
 # vidDataPrep
 
-Two-stage pipeline for turning a shared Google Drive folder of raw footage into a frame-level dataset:
+Downloads raw footage from a shared Google Drive folder to local disk (`download_drive_folder.py`, or `main.py` as a thin wrapper reading local paths from `.env`) — pulling an entire, possibly huge and deeply nested folder via the Google Drive API, bypassing the web UI's 2GB zip-export limit.
 
-1. **Download** — pulls an entire (possibly huge, nested) Drive folder to local disk via the Google Drive API, bypassing the web UI's 2GB zip-export limit.
-2. **Extract frames** — recursively walks the downloaded tree, regardless of depth or naming convention, finds every video, and extracts every frame into a mirrored output tree.
-
-Both stages can be run together as a single pipeline, or independently.
+On top of that, this repo includes a separate, standalone toolset for turning that footage into a YOLO training dataset: `label_with_mouse.py` (manual mouse-driven labeling) and `auto_label.py` (YOLO-based auto-labeling, optionally restricted to the regions a human already labeled). Both operate directly on video files. These are not wired into `main.py` — see [Labeling Tools](#labeling-tools).
 
 ---
 
@@ -18,6 +15,7 @@ Both stages can be run together as a single pipeline, or independently.
 - [Usage](#usage)
 - [How It Works](#how-it-works)
 - [Troubleshooting](#troubleshooting)
+- [Labeling Tools](#labeling-tools)
 - [FAQ](#faq)
 - [Security Notes](#security-notes)
 
@@ -27,9 +25,7 @@ Both stages can be run together as a single pipeline, or independently.
 
 Google Drive's web UI only lets you download folders as `.zip` archives, capped at roughly 2GB each. For folders containing hundreds of gigabytes — common with drone footage, datasets, video archives, or research data — that means dozens of unlabeled zip files to download one by one and merge back together by hand. `download_drive_folder.py` bypasses that entirely by talking to the Google Drive API directly, downloading each file individually and recreating the original folder structure locally — no zipping, no size cap, no manual reassembly.
 
-Once footage is downloaded, it rarely arrives tidily organized. Source footage for this project was dumped into a root folder with no consistent naming convention, no consistent folder depth (some videos sit directly in the root, others nested 3–4 subfolders deep), and no consistent tree shape between sibling branches. Manually hunting down every video and extracting frames one by one doesn't scale, so `extract_frames.py` walks the entire tree regardless of depth or naming, finds every video file it encounters, and extracts its frames — without touching or reorganizing the original data.
-
-The two scripts started out as independent tools, each run by hand with its own arguments. In practice they're always run back-to-back on the same data — whatever gets downloaded is exactly what needs frames extracted from it — so `main.py` and `.env` tie them into a single pipeline: local paths configured once, one command for the full run. Neither script lost its standalone usability in the process.
+`main.py` is a thin convenience wrapper around it: it reads the local download destination from `.env` (`DATA_DIR`) so only the Drive folder link — the one thing that changes every run — needs to be typed each time. `download_drive_folder.py` remains fully usable on its own, unchanged.
 
 ## Features
 
@@ -43,23 +39,9 @@ The two scripts started out as independent tools, each run by hand with its own 
 - Works with both personal Drive folders and Shared Drives (Team Drives)
 - 100% free — no billing account or paid API tier required
 
-### Frame extraction stage
-- Depth-agnostic recursion — descends into every subfolder no matter how deeply nested, with no assumptions about tree shape
-- Non-destructive — reads from the input tree only; all output is written to a separate output tree
-- Mirrored output structure — the output tree reproduces the input tree's folder layout, with each video replaced by a same-named folder of its extracted frames
-- Automatic video detection — matches by file extension (`.mp4`, `.avi`, `.mov`, `.mkv`, `.flv`, `.wmv`, `.webm`, `.m4v`), case-insensitive
-- Every frame extracted — no subsampling; every frame in the video is written out
-- Sequential frame naming — frames are numbered `1.jpg`, `2.jpg`, `3.jpg`, ... within each video's folder
-- Handles duplicate video names safely — two videos named `clip.mp4` in different subfolders never collide
-- Mixed folders supported — a folder containing both videos and subfolders has both processed
-- Graceful failure handling — unreadable folders and unopenable/corrupt videos are logged as warnings and skipped, not fatal errors
-
-### Pipeline
-- One command for the full pipeline — `python3 main.py <FOLDER_ID_OR_URL>` downloads then extracts, back-to-back
-- Each stage still fully standalone — either script can be run alone, unchanged, for one-off or partial runs
-- Paths configured once, in `.env` — only the Drive folder link (the one thing that changes every run) needs to be typed
-- CLI flags still override `.env` — passing `--dest`, `root_folder`, or `-o` explicitly takes priority over the `.env` default
-- `DATA_DIR` chains the two stages together — it's simultaneously the download destination and the frame-extraction input
+### main.py wrapper
+- `python3 main.py <FOLDER_ID_OR_URL>` — same effect as running `download_drive_folder.py` directly, but reads the destination path from `.env` (`DATA_DIR`) instead of requiring `--dest` each time
+- `download_drive_folder.py` remains fully standalone — `main.py` calls its `run(...)` function directly rather than wrapping/shelling out to it
 
 ## Prerequisites
 
@@ -67,7 +49,7 @@ The two scripts started out as independent tools, each run by hand with its own 
 - `venv` module (standard library — no separate install needed)
 - A Google account with access to the shared Drive folder (i.e. the folder was shared with your email, or shared as "Anyone with the link")
 - ~10 minutes for a one-time Google Cloud OAuth client setup
-- Enough free disk space for **both** the downloaded footage and the extracted frames — every-frame JPEG extraction can easily produce more data on disk than the source videos, especially for long or high-resolution footage, and source footage for this project can run into the hundreds of GB
+- Enough free disk space for the downloaded footage — source footage for this project can run into the hundreds of GB
 
 ## Implementation Steps
 
@@ -83,13 +65,11 @@ One-time setup to get the pipeline ready to run:
    pip install -r requirements.txt
    ```
 3. **Set up Google Drive OAuth credentials** — see [Google Cloud OAuth Setup](#google-cloud-oauth-setup) below.
-4. **Configure `.env`** with the local paths the pipeline should use (already present in this repo with these defaults — edit if you want different locations):
+4. **Configure `.env`** with the local path `main.py` should use (already present in this repo with this default — edit if you want a different location):
    ```
    DATA_DIR=./data
-   FRAMES_OUTPUT_DIR=./data_frames
    ```
-   - `DATA_DIR` is where the Drive folder gets downloaded to, and also where `extract_frames.py` looks for videos by default.
-   - `FRAMES_OUTPUT_DIR` is where extracted frames are written. If unset, it defaults to `<DATA_DIR>_frames`.
+   `DATA_DIR` is where the Drive folder gets downloaded to. It's also the default `--data-root` for `auto_label.py`'s standalone batch mode (see [Labeling Tools](#labeling-tools)).
 5. **Verify the install:**
    ```bash
    python3 -c "import cv2; print(cv2.__version__)"
@@ -137,15 +117,15 @@ Needed once, before the download stage can authenticate.
 
 ## Usage
 
-**Full pipeline** — only the Drive folder link changes between runs, so it's the only argument:
+**Via `main.py`** — only the Drive folder link changes between runs, so it's the only argument:
 
 ```bash
 python3 main.py <FOLDER_ID_OR_URL>
 ```
 
-This downloads into `DATA_DIR`, then extracts frames from everything in it into `FRAMES_OUTPUT_DIR`.
+This downloads into `DATA_DIR` (from `.env`).
 
-**Download stage alone:**
+**`download_drive_folder.py` directly** — same logic, with an explicit destination override:
 
 ```bash
 python3 download_drive_folder.py <FOLDER_ID_OR_URL> [--dest DEST_DIR]
@@ -158,58 +138,12 @@ python3 download_drive_folder.py <FOLDER_ID_OR_URL> [--dest DEST_DIR]
 
 The script prints progress per file (`[n] path — xx%`) and logs `[skip, exists]` for files already fully downloaded in a previous run, making it safe to interrupt (`Ctrl+C`) and resume at any time.
 
-**Frame extraction stage alone:**
-
-```bash
-python3 extract_frames.py [root_folder] [-o OUTPUT_DIR]
-```
-
-| Argument | Required | Description |
-|---|---|---|
-| `root_folder` | No | Path to the top of the folder tree to scan for videos. Defaults to `$DATA_DIR` from `.env` if set; required if `DATA_DIR` isn't set. |
-| `-o`, `--output` | No | Path to the output root. Defaults to `$FRAMES_OUTPUT_DIR` from `.env` if set, otherwise `<root_folder>_frames` alongside the input. |
-
-Example, given:
-
-```
-raw_footage/
-├── video1.mp4
-├── site_a/
-│   └── cam2.avi
-└── site_b/
-    └── 2024-batch/
-        └── unlabeled.mkv
-```
-
-```bash
-python3 extract_frames.py raw_footage -o raw_footage_frames
-```
-
-produces:
-
-```
-raw_footage_frames/
-├── video1/
-│   ├── 1.jpg
-│   ├── 2.jpg
-│   └── ...
-├── site_a/
-│   └── cam2/
-│       ├── 1.jpg
-│       └── ...
-└── site_b/
-    └── 2024-batch/
-        └── unlabeled/
-            ├── 1.jpg
-            └── ...
-```
-
 ## How It Works
 
-### Pipeline orchestration
-- `main.py` loads `.env`, then calls each stage's `run(...)` function directly (`download_drive_folder.run(drive_folder, data_dir)`, then `extract_frames.run(data_dir, frames_output)`) — it does not shell out or re-parse command-line arguments.
-- Both `download_drive_folder.py` and `extract_frames.py` are split into a `run(...)` function (the actual logic) and a thin `main()` CLI wrapper (argument parsing only). This is what lets `main.py` call the real logic directly while each script's own `argparse`-based `main()` keeps working unchanged for standalone use.
-- Priority order for local paths on each stage: an explicit CLI flag always wins, otherwise the `.env` value is used, otherwise a hardcoded fallback (e.g. `./downloaded_data`) applies.
+### main.py wrapper
+- `main.py` loads `.env`, then calls `download_drive_folder.run(drive_folder, data_dir)` directly — it does not shell out or re-parse command-line arguments.
+- `download_drive_folder.py` is split into a `run(...)` function (the actual logic) and a thin `main()` CLI wrapper (argument parsing only). This is what lets `main.py` call the real logic directly while the script's own `argparse`-based `main()` keeps working unchanged for standalone use.
+- Priority order for the local download path: an explicit `--dest` flag always wins, otherwise the `.env` value (`DATA_DIR`) is used, otherwise a hardcoded fallback (`./downloaded_data`) applies.
 - `python-dotenv`'s `load_dotenv()` locates `.env` relative to the *script file's* own location, not your current shell directory — so the `.env` in the project root is always found regardless of where you invoke `python3` from.
 
 ### Download stage
@@ -220,19 +154,9 @@ raw_footage_frames/
 - Google-native file types (Docs, Sheets, Slides, Drawings) are converted via the Drive API's `export_media` endpoint into standard formats (`.docx`, `.xlsx`, `.pptx`, `.pdf`) since they have no native binary form to download.
 - Automatically retries with exponential backoff on transient HTTP or network errors.
 
-### Frame extraction stage
-1. `process_folder(input_dir, output_dir)` lists the immediate contents of `input_dir`.
-2. For each entry:
-   - **It's a directory** → recurse into it, passing the matching subfolder under `output_dir` so the tree shape is mirrored.
-   - **It's a video file** (matched by extension via `is_video_file`) → a folder named after the video (its filename without extension) is created under the *current* output directory, and `extract_frames` is called on it.
-   - **Anything else** (non-video files) → ignored.
-3. `extract_frames(video_path, frames_dir)` opens the video with OpenCV's `cv2.VideoCapture`, reads frames one at a time in a loop until the video is exhausted, and writes each one as `<frame_number>.jpg` into `frames_dir`.
-4. Because recursion always passes the *matching* subfolder path down, and each video gets its own subfolder (`output_dir / entry.stem`), the output tree ends up structurally identical to the input tree, except every video is replaced by a folder of its frames.
-5. Output directories are only created lazily, at the point a video is actually found — branches of the input tree with no videos in them don't produce empty folders in the output.
-
 ## Troubleshooting
 
-### Pipeline
+### General
 
 **`ModuleNotFoundError: No module named 'dotenv'` (or `cv2`, or `googleapiclient`)**
 → Dependencies aren't installed in the active environment. Run `pip install -r requirements.txt` inside your activated virtual environment.
@@ -242,9 +166,6 @@ raw_footage_frames/
 
 **`main.py` exits with "the following arguments are required: drive_folder"**
 → `main.py` only accepts the Drive folder ID/URL as an argument by design; pass it explicitly each run, e.g. `python3 main.py "https://drive.google.com/drive/folders/..."`.
-
-**Frame extraction runs against the wrong (or an empty) folder**
-→ Check `DATA_DIR` in `.env` — it must point at the same directory `download_drive_folder.py` downloaded into, since that's what chains the two stages together.
 
 ### Download stage
 
@@ -266,30 +187,105 @@ raw_footage_frames/
 **"This app isn't verified" warning won't go away**
 → Expected and harmless for personal-use OAuth apps in Testing mode. Click **Advanced → Go to [app name] (unsafe)** — "unsafe" just means Google hasn't manually reviewed it.
 
-### Frame extraction stage
-
 **`pip freeze` shows unrelated packages (e.g. ROS2 packages) that aren't in `requirements.txt`**
 → This happens if your shell profile sets a `PYTHONPATH` environment variable (common with ROS/ROS2 setups) — it leaks system-level packages into `pip freeze` output even inside an activated venv, since `PYTHONPATH` isn't cleared by venv activation. Check with `echo $PYTHONPATH`. Doesn't affect what the script actually imports, but verify with `PYTHONPATH= pip freeze` if you ever regenerate `requirements.txt`.
 
-**`[WARN] Could not open video: ...`**
-→ OpenCV couldn't open that file — it may be corrupted, use an unsupported codec, or not actually be a valid video despite the extension. The script logs it and continues to the next file rather than stopping the whole run.
+## Labeling Tools
 
-**`[WARN] Skipping unreadable folder: ...`**
-→ A `PermissionError` occurred while listing that folder's contents. Check ownership/permissions on that folder if you need it processed.
+A separate, standalone toolset for turning video into a YOLO training dataset — independent of the download step above (it operates on video files directly, e.g. from `DATA_DIR`, not on any intermediate output tree):
 
-**Run seems slow / takes a long time**
-→ Every-frame extraction of long or high-resolution videos is disk- and CPU-bound. There's no parallelism currently — folders and videos are processed strictly one at a time.
+- **`label_with_mouse.py`** — a human plays back a video and follows the object of interest with the mouse (or clicks explicitly), producing a per-frame CSV of bounding-box coordinates.
+- **`auto_label.py`** — runs a YOLO model to produce a YOLO-format labeled dataset (images + label files, split into `train`/`val`/`test`/`review` by confidence). Can be driven by a `label_with_mouse.py` CSV (detection restricted to the manually-labeled region of each frame) or run standalone in full-frame batch mode over a folder of videos.
 
-**Re-running the script**
-→ It does not check for or skip already-extracted videos — re-running overwrites existing frame files in the output tree. Delete or move the previous output first if you want a clean slate, or point `-o` / `FRAMES_OUTPUT_DIR` at a new location.
+### Features
+
+**Manual labeling (`label_with_mouse.py`)**
+- Mouse-follow labeling — move the mouse over the object while playing; its position is recorded per frame
+- Pause/step controls (`n`/`p`) to review and correct individual frames
+- Explicit "no object" marking (`x`) for stretches where the object leaves frame — a hard boundary that blocks interpolation/carry-forward across it
+- Interpolation and carry-forward fill in frames between sparse manual points (each independently toggleable via `--no-interpolate`/`--no-carry-forward`)
+- Zoom/pan (mouse wheel + `i`/`j`/`k`/`l`) for precise clicking on small or distant objects — saved coordinates always use the video's original resolution regardless of zoom level
+- Extra objects — Ctrl+click adds a second (or third, ...) object on the current frame, independent of the primary tracked point and not interpolated across frames
+- Configurable bounding box size around the tracked point (`--bbox-w`/`--bbox-h`, default 640×320)
+- `--auto-label` chains straight into auto-labeling on the just-saved CSV, in the same run
+
+**Auto-labeling (`auto_label.py`)**
+- ROI-restricted mode (`auto_label_video()`, used via `--auto-label`) — for each manually-labeled frame, crops to the labeled box(es) (the primary object plus any extra objects), padded by `--crop-margin`, and runs YOLO only on that crop, instead of searching the full frame
+- Detections are remapped from crop-local coordinates back to full-frame-normalized YOLO coordinates before being written out
+- Frames with no manual label (source `none`, and no extra objects) are skipped entirely — never sent to `review`
+- Confidence-based routing: frames where every detection meets `--high-conf` go to `train`/`val`/`test` (70/20/10 split); anything with a low-confidence or missing detection goes to `review`
+- Resumable — `master_pipeline_log.json` tracks every frame ever processed. `train`/`val`/`test` frames are never reprocessed; `review` frames are retried on the next run (a better/re-trained model may clear the threshold later), and promoted frames have their stale `review` copies removed automatically
+- Standalone batch mode (`python3 auto_label.py --model-path ...`) — full-frame detection over every video under `--data-root`, with no manual labeling involved; the entry point for a future no-manual-intervention pipeline
+- `auto_label.py` has no side effects on import — `label_with_mouse.py` only imports it lazily, inside `run()`, when `--auto-label` is actually passed, so a manual-only session never loads `ultralytics` or a model
+
+### Usage
+
+**Manual labeling alone:**
+```bash
+python3 label_with_mouse.py /path/to/video.mp4
+```
+Produces `output/manual_labels/video.csv`. Playback starts paused; press Space to begin. See the script's module docstring (or run with the window focused) for the full key reference — pause/step, zoom/pan, marking "no object", extra objects, etc.
+
+**Manual labeling + auto-labeling in one session:**
+```bash
+python3 label_with_mouse.py /path/to/video.mp4 --auto-label --model-path /path/to/yolo_weights.pt
+```
+
+| Flag | Description |
+|---|---|
+| `--bbox-w`, `--bbox-h` | Bounding box size in pixels around the tracked point (default: 640×320). |
+| `--playback-speed` | Initial playback speed multiplier (default: 0.4); adjustable live with `+`/`-`. |
+| `--start-frame` | Frame index to start annotation from (default: 0). |
+| `--no-interpolate` / `--no-carry-forward` | Disable filling in frames between sparse manual points. |
+| `--auto-label` | Run auto-labeling on the manually-labeled regions after saving the CSV. Requires `--model-path`. |
+| `--model-path` | Path to YOLO model weights (required with `--auto-label`). |
+| `--crop-margin` | Padding added around each manually-labeled box before detection, as a fraction of the box's own width/height (default: 0.5). |
+
+**Auto-labeling alone (batch, full-frame, no manual CSV):**
+```bash
+python3 auto_label.py --model-path /path/to/yolo_weights.pt [--data-root ./data] [--output-dir ./output/labeled_data] [--high-conf 0.8] [--target-width 1280]
+```
+Recursively finds every video under `--data-root` (`.mp4`, `.MP4`, `.avi`, `.mkv`) and runs full-frame YOLO detection on every frame of every video.
+
+### How It Works
+
+- Both `label_with_mouse.py` and `auto_label.py` resolve `output/` relative to their own script's location, not the current working directory, so results land in the same place regardless of where you invoke them from.
+- `label_with_mouse.py`'s CSV has one row per frame — `frame, time_sec, cx, cy, x1, y1, x2, y2, source` — where `source` is `manual`, `interp`, `carry`, or `none`; extra (Ctrl-click) objects get additional rows tagged `manual` on the same frame index.
+- `auto_label.py`'s ROI mode (`auto_label_video`) parses that CSV into `frame_idx -> [ROIs]` (the primary box, if not `none`, plus any extra-object rows) and only processes frames that appear in that map. Frame numbering is 0-indexed, matching the CSV's `frame` column.
+- Both label-producing paths — ROI-restricted (from a CSV) and full-frame (batch mode) — funnel through the same routing/save logic (`_route_and_save`), so `train`/`val`/`test`/`review` behavior is identical either way; only how detections are found differs.
+
+**Output layout:**
+```
+output/
+├── manual_labels/
+│   └── <video_name>.csv                 # from label_with_mouse.py
+└── labeled_data/                        # from auto_label.py — shared/accumulated across videos
+    ├── master_pipeline_log.json
+    ├── session_<timestamp>.json         # frames added in one run, for targeted review
+    ├── train/{images,labels}/
+    ├── val/{images,labels}/
+    ├── test/{images,labels}/
+    └── review/{images,labels}/
+```
+
+### Troubleshooting
+
+**`--auto-label requires --model-path`**
+→ Auto-labeling needs YOLO model weights; pass `--model-path /path/to/weights.pt`.
+
+**Auto-labeling reports "nothing to auto-label"**
+→ The CSV for that video has no non-`none` rows — nothing was manually labeled, or every frame was explicitly marked "no object".
+
+**`ModuleNotFoundError: No module named 'ultralytics'`**
+→ Install it via `pip install -r requirements.txt` (added specifically for the auto-labeling path — not needed for manual-only labeling).
 
 ## Security Notes
 
 - **Never commit `credentials.json` or `token.json`.** `credentials.json` identifies your OAuth client, and `token.json` contains an active access/refresh token tied to your Google account — both are already excluded via this repo's `.gitignore`. If either is accidentally published, revoke access immediately from your [Google Account permissions page](https://myaccount.google.com/permissions) and delete/regenerate the OAuth client in Google Cloud Console.
 - **Drive access is read-only.** `download_drive_folder.py` requests only the `drive.readonly` scope — it cannot modify, delete, or upload anything to your Drive.
 - **`.env` holds only local paths, not secrets** — but it's still excluded from version control as machine-specific configuration.
-- **`extract_frames.py` has no network activity of its own** — only the download stage talks to the network. Frame extraction only reads from and writes to the local filesystem.
-- **Runs with your user's filesystem permissions.** Neither stage escalates privileges, but neither is stopped from overwriting files in an output path that already contains unrelated data with matching names.
-- **Untrusted video files.** Video decoding is handled by OpenCV, which in turn relies on underlying media libraries (e.g. FFmpeg-based backends) that have historically had memory-safety vulnerabilities in malformed-file parsing. If any videos in `DATA_DIR` come from an untrusted or external source, consider running frame extraction in a sandboxed/disposable environment rather than directly on a machine with sensitive access.
-- **Disk exhaustion.** Downloaded footage plus every-frame JPEG extraction can consume significant disk space quickly — there's no built-in disk-space check or quota in either stage, so monitor available space on large batches.
+- **Runs with your user's filesystem permissions.** Nothing here escalates privileges, but nothing is stopped from overwriting files in an output path that already contains unrelated data with matching names.
+- **Untrusted video files.** Video decoding (in `label_with_mouse.py` and `auto_label.py`) is handled by OpenCV, which in turn relies on underlying media libraries (e.g. FFmpeg-based backends) that have historically had memory-safety vulnerabilities in malformed-file parsing. If any videos in `DATA_DIR` come from an untrusted or external source, consider running the labeling tools in a sandboxed/disposable environment rather than directly on a machine with sensitive access.
+- **Disk exhaustion.** Downloaded footage plus the labeled-image dataset auto-labeling writes out can consume significant disk space quickly — there's no built-in disk-space check or quota, so monitor available space on large batches.
 - **Dependencies are pinned** in `requirements.txt` to specific versions, so re-creating the environment from this repo gives a reproducible, isolated dependency set rather than relying on whatever is globally installed.
+- **Labeling tools have no network activity.** `label_with_mouse.py` and `auto_label.py` only read local video files and a user-supplied local model weights path (`--model-path`) — no data leaves the machine.

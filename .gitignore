@@ -7,7 +7,7 @@ __pycache__/
 
 # Data
 data/
-data_frames/
+output/
 
 # Local config
 .env
@@ -15,4 +15,3 @@ data_frames/
 # Security
 credentials.json
 token.json
-
