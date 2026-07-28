@@ -195,7 +195,8 @@ The script prints progress per file (`[n] path — xx%`) and logs `[skip, exists
 A separate, standalone toolset for turning video into a YOLO training dataset — independent of the download step above (it operates on video files directly, e.g. from `DATA_DIR`, not on any intermediate output tree):
 
 - **`label_with_mouse.py`** — a human plays back a video and follows the object of interest with the mouse (or clicks explicitly), producing a per-frame CSV of bounding-box coordinates.
-- **`auto_label.py`** — runs a YOLO model to produce a YOLO-format labeled dataset (images + label files, split into `train`/`val`/`test`/`review` by confidence). Can be driven by a `label_with_mouse.py` CSV (detection restricted to the manually-labeled region of each frame) or run standalone in full-frame batch mode over a folder of videos.
+- **`auto_label.py`** — runs a YOLO model to produce YOLO-format image+label pairs. Can be driven by a `label_with_mouse.py` CSV (detection restricted to the manually-labeled region of each frame), on one specific video (`--video`), or run standalone in full-frame batch mode over a folder of videos (`--data-root`). Every frame it processes lands in `review/` — it never decides on its own that a frame is good enough for training.
+- **`verify.py`** — the human-in-the-loop gate: browse `review/` frames (boxes drawn live for inspection, never written back to the image file), and promote accepted ones into `train`/`val`/`test`, or demote a bad accepted frame back to `review`. Nothing reaches `train`/`val`/`test` except through this step.
 
 ### Features
 
@@ -213,10 +214,18 @@ A separate, standalone toolset for turning video into a YOLO training dataset �
 - ROI-restricted mode (`auto_label_video()`, used via `--auto-label`) — for each manually-labeled frame, crops to the labeled box(es) (the primary object plus any extra objects), padded by `--crop-margin`, and runs YOLO only on that crop, instead of searching the full frame
 - Detections are remapped from crop-local coordinates back to full-frame-normalized YOLO coordinates before being written out
 - Frames with no manual label (source `none`, and no extra objects) are skipped entirely — never sent to `review`
-- Confidence-based routing: frames where every detection meets `--high-conf` go to `train`/`val`/`test` (70/20/10 split); anything with a low-confidence or missing detection goes to `review`
-- Resumable — `master_pipeline_log.json` tracks every frame ever processed. `train`/`val`/`test` frames are never reprocessed; `review` frames are retried on the next run (a better/re-trained model may clear the threshold later), and promoted frames have their stale `review` copies removed automatically
-- Standalone batch mode (`python3 auto_label.py --model-path ...`) — full-frame detection over every video under `--data-root`, with no manual labeling involved; the entry point for a future no-manual-intervention pipeline
+- Every processed frame lands in `review/` unconditionally, regardless of detection confidence — including frames with zero detections, which get an empty label file (a possible missed object, not an error). Confidence plays no role in where a frame goes; this script never promotes a frame to training itself — that's `verify.py`'s job
+- Resumable — `master_pipeline_log.json` tracks every frame ever processed. Frames already promoted to `train`/`val`/`test` (by `verify.py`) are never reprocessed/overwritten; everything still in `review` is retried on the next run and overwritten in place with the latest detection results
+- Standalone batch mode (`python3 auto_label.py --model-path ...`) — full-frame detection over every video under `--data-root`, with no manual labeling involved; the entry point for a future no-manual-intervention pipeline. `--video /path/to/video.mp4` runs that same full-frame detection on just one named video instead of scanning a whole folder
+- Progress is logged periodically (every 100 frames: running counts, fps, elapsed/ETA) rather than per individual frame save; at the end of every run, prints how many processed frames got at least one detection ("labels") vs. how many got none
 - `auto_label.py` has no side effects on import — `label_with_mouse.py` only imports it lazily, inside `run()`, when `--auto-label` is actually passed, so a manual-only session never loads `ultralytics` or a model
+
+**Verification (`verify.py`)**
+- Interactive review over `master_pipeline_log.json` — pick a filter (just `review`, just `train`/`val`/`test`, empty-label "background" frames, or everything) and an optional confidence window, then step through matches one at a time
+- Boxes from the paired `.txt` label are drawn live onto the frame for display only (`draw_yolo_boxes()`) — the saved `.jpg` on disk is never modified
+- `y` promotes a `review` frame into `train`/`val`/`test` (random 70/20/10 split, same weighting `auto_label.py` used to do automatically); `n` demotes an accepted frame back to `review`; both physically move the image+label pair between folders and update the log
+- `u` undoes the last promote/demote; `a`/`d` (or arrow keys) browse without deciding; `q` pauses and saves your position, resumable next run with the same filter
+- `--session path/to/session_<timestamp>.json` narrows the queue to just the frames a specific `auto_label.py` run added, instead of the whole log
 
 ### Usage
 
@@ -241,31 +250,48 @@ python3 label_with_mouse.py /path/to/video.mp4 --auto-label --model-path /path/t
 | `--model-path` | Path to YOLO model weights (required with `--auto-label`). |
 | `--crop-margin` | Padding added around each manually-labeled box before detection, as a fraction of the box's own width/height (default: 0.5). |
 
+**Auto-labeling alone, from an existing manual CSV** (video located automatically under `--data-root`, no need to know its path/subfolder):
+```bash
+python3 auto_label.py --model-path /path/to/yolo_weights.pt --csv output/manual_labels/video.csv [--crop-margin 0.5]
+```
+
+**Auto-labeling alone, full-frame on one specific video** (no ROI/CSV restriction):
+```bash
+python3 auto_label.py --model-path /path/to/yolo_weights.pt --video /path/to/video.mp4
+```
+
 **Auto-labeling alone (batch, full-frame, no manual CSV):**
 ```bash
-python3 auto_label.py --model-path /path/to/yolo_weights.pt [--data-root ./data] [--output-dir ./output/labeled_data] [--high-conf 0.8] [--target-width 1280]
+python3 auto_label.py --model-path /path/to/yolo_weights.pt [--data-root ./data] [--output-dir ./output/labeled_data] [--target-width 1280]
 ```
-Recursively finds every video under `--data-root` (`.mp4`, `.MP4`, `.avi`, `.mkv`) and runs full-frame YOLO detection on every frame of every video.
+Recursively finds every video under `--data-root` (`.mp4`, `.avi`, `.mkv`, case-insensitive) and runs full-frame YOLO detection on every frame of every video. `--video` and `--csv` are mutually exclusive with each other; both are mutually exclusive with `--data-root` batch mode by simply being specified.
+
+**Verification, to promote `review` frames into `train`/`val`/`test`:**
+```bash
+python3 verify.py [--session output/labeled_data/session_<timestamp>.json [--session-split active|review]]
+```
+Without `--session`, you're prompted interactively for a split/confidence filter over the whole `master_pipeline_log.json`. With `--session`, the queue is narrowed to just the frames one specific `auto_label.py` run added.
 
 ### How It Works
 
-- Both `label_with_mouse.py` and `auto_label.py` resolve `output/` relative to their own script's location, not the current working directory, so results land in the same place regardless of where you invoke them from.
+- All three scripts resolve `output/` relative to their own script's location, not the current working directory, so results land in the same place regardless of where you invoke them from.
 - `label_with_mouse.py`'s CSV has one row per frame — `frame, time_sec, cx, cy, x1, y1, x2, y2, source` — where `source` is `manual`, `interp`, `carry`, or `none`; extra (Ctrl-click) objects get additional rows tagged `manual` on the same frame index.
 - `auto_label.py`'s ROI mode (`auto_label_video`) parses that CSV into `frame_idx -> [ROIs]` (the primary box, if not `none`, plus any extra-object rows) and only processes frames that appear in that map. Frame numbering is 0-indexed, matching the CSV's `frame` column.
-- Both label-producing paths — ROI-restricted (from a CSV) and full-frame (batch mode) — funnel through the same routing/save logic (`_route_and_save`), so `train`/`val`/`test`/`review` behavior is identical either way; only how detections are found differs.
+- Both label-producing paths — ROI-restricted (from a CSV) and full-frame (single-video or batch mode) — funnel through the same save logic (`_route_and_save`), which always writes to `review/`; `train`/`val`/`test` only ever get populated by `verify.py` moving files out of `review/`.
 
 **Output layout:**
 ```
 output/
 ├── manual_labels/
 │   └── <video_name>.csv                 # from label_with_mouse.py
-└── labeled_data/                        # from auto_label.py — shared/accumulated across videos
-    ├── master_pipeline_log.json
-    ├── session_<timestamp>.json         # frames added in one run, for targeted review
-    ├── train/{images,labels}/
-    ├── val/{images,labels}/
-    ├── test/{images,labels}/
-    └── review/{images,labels}/
+└── labeled_data/                        # from auto_label.py + verify.py — shared/accumulated across videos
+    ├── master_pipeline_log.json         # every frame ever processed, and its current split
+    ├── session_<timestamp>.json         # frames added in one auto_label.py run, for targeted verify.py review
+    ├── verify_session.json              # verify.py's own resume position (created on first `q` pause)
+    ├── train/{images,labels}/           # populated only by verify.py promotions
+    ├── val/{images,labels}/             # populated only by verify.py promotions
+    ├── test/{images,labels}/            # populated only by verify.py promotions
+    └── review/{images,labels}/          # everything auto_label.py writes lands here first
 ```
 
 ### Troubleshooting
@@ -278,6 +304,12 @@ output/
 
 **`ModuleNotFoundError: No module named 'ultralytics'`**
 → Install it via `pip install -r requirements.txt` (added specifically for the auto-labeling path — not needed for manual-only labeling).
+
+**`verify.py` says "Log file not found"**
+→ Run `auto_label.py` at least once first — `verify.py` reads `output/labeled_data/master_pipeline_log.json`, which only exists after auto-labeling has processed at least one frame.
+
+**Frames sit in `review/` forever and never reach `train`/`val`/`test`**
+→ Expected — `auto_label.py` never promotes a frame on its own, regardless of detection confidence. Run `verify.py` and press `y` on the frames you want to accept.
 
 ## Security Notes
 
