@@ -12,12 +12,12 @@ output/ is created next to this script, regardless of where the input video
 lives or which directory the script is run from.
 
 With --auto-label, after the manual CSV is saved, auto_label.py is invoked to
-run YOLO detection restricted to the manually-labeled regions of each frame,
-producing a YOLO-format dataset under output/labeled_data/ (see auto_label.py).
+run YOLO detection restricted to the manually-labeled regions of each frame. Every
+processed frame lands in output/labeled_data/review/ unconditionally - see
+auto_label.py. Nothing is auto-promoted to train/val/test; that's verify.py's job.
 
-This is a standalone labeling tool, independent of the download/extract
-pipeline (main.py, download_drive_folder.py, extract_frames.py) - it is not
-wired into that pipeline.
+This is a standalone labeling tool, independent of the download pipeline
+(main.py, download_drive_folder.py) - it is not wired into that pipeline.
 
 Usage:
     python label_with_mouse.py /path/to/video.mp4 [options]

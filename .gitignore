@@ -15,3 +15,6 @@ output/
 # Security
 credentials.json
 token.json
+
+# Models
+*.pt
