@@ -2,7 +2,7 @@
 """
 Auto-label video frames into a YOLO-format dataset using a YOLO model.
 
-Two entry points:
+Four entry points:
 
 - auto_label_video(...): labels only the manually-labeled regions of a single video,
   driven by a label_with_mouse.py CSV (frame -> primary + extra object boxes). Each
@@ -10,23 +10,33 @@ Two entry points:
   back to full-frame-normalized YOLO coordinates. Meant to be imported and called by
   label_with_mouse.py after a manual session, via --auto-label.
 
-- Running this file directly (`python auto_label.py --model-path ...`) batch-labels
-  every frame of every video under --data-root using full-frame detection, with no
-  manual ROI restriction - for the future no-manual-intervention pipeline.
+- `python auto_label.py --model-path ... --csv output/manual_labels/video.csv`: the
+  same ROI-restricted labeling as above, but as a CLI - the video itself is located by
+  recursively searching --data-root for a file whose name matches the CSV's, so you
+  don't need to know/type its path or subfolder depth.
 
-Both write into the same output/labeled_data/ dataset (train/val/test/review splits,
-plus a resumable master_pipeline_log.json), so results accumulate across videos and
-across the two modes.
+- `python auto_label.py --model-path ... --video /path/to/video.mp4`: full-frame
+  detection (no ROI restriction) on exactly one named video file.
+
+- `python auto_label.py --model-path ...` (no --csv, no --video): batch-labels every
+  frame of every video under --data-root using full-frame detection, with no manual
+  ROI restriction - for the future no-manual-intervention pipeline.
+
+All four write into the same output/labeled_data/ dataset (plus a resumable
+master_pipeline_log.json), so results accumulate across videos and across modes.
+
+Every frame this script processes lands in labeled_data/review/ unconditionally -
+confidence plays no role in where a frame goes, and this script never auto-promotes
+a frame into train/val/test itself. Promotion out of review/ is a human-in-the-loop
+step done separately with verify.py.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import glob
 import json
-import os
-import random
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -36,12 +46,13 @@ OUTPUT_ROOT = Path(__file__).resolve().parent / "output"
 LABELED_DATA_DIR = OUTPUT_ROOT / "labeled_data"
 
 DEFAULT_DATA_ROOT = "./data"
-DEFAULT_HIGH_CONF = 0.8       # all detections in a frame must meet this to go to train/val/test
 DEFAULT_TARGET_WIDTH = 1280   # downscale saved images to this width, keeping aspect ratio
-DEFAULT_CROP_MARGIN = 0.5     # fraction of each ROI's own width/height added as padding per side
+DEFAULT_CROP_MARGIN = 4     # fraction of each ROI's own width/height added as padding per side
 JPEG_QUALITY = 85
+PROGRESS_INTERVAL = 100       # print a progress heartbeat every this many processed frames
 
 SPLITS = ("train", "val", "test", "review")
+VIDEO_EXTENSIONS = (".mp4", ".avi", ".mkv")
 
 
 def _ensure_split_dirs(output_dir: Path) -> None:
@@ -61,6 +72,31 @@ def _save_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
         json.dump(data, f, indent=2)
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h{m:02d}m{s:02d}s"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def _log_progress(processed: int, total: int, split_counts: dict[str, int], start_time: float) -> None:
+    """Print a periodic progress heartbeat - called every PROGRESS_INTERVAL processed
+    frames, not per frame, so it doesn't drown out everything else in noise."""
+    elapsed = time.monotonic() - start_time
+    rate = processed / elapsed if elapsed > 0 else 0.0
+    remaining = (total - processed) / rate if rate > 0 else 0.0
+    counts_str = " ".join(f"{k}={v}" for k, v in split_counts.items())
+    pct = (processed / total * 100) if total else 100.0
+    print(
+        f"  [progress] {processed}/{total} ({pct:.1f}%) | {counts_str} | "
+        f"{rate:.1f} fps | elapsed {_format_duration(elapsed)} | ETA {_format_duration(remaining)}"
+    )
 
 
 def _read_rois_by_frame(csv_path: Path) -> dict[int, list[tuple[int, int, int, int]]]:
@@ -100,31 +136,19 @@ def _route_and_save(
     yolo_lines: list[str],
     confidences_in_frame: list[float],
     output_dir: Path,
-    high_conf: float,
     target_width: int,
     execution_log: dict,
     session_log: dict,
-) -> None:
-    """Apply the confidence-based routing decision, write the resized image + YOLO
-    label file, and update execution_log/session_log in place.
-    - ALL detections >= high_conf  -> train/val/test (clean positive)
-    - ANY detection  <  high_conf  -> review (ambiguous, needs manual check)
-    - No detections at all         -> review (possible missed object)
-    """
+) -> str:
+    """Write the resized image + YOLO label file into review/, and update
+    execution_log/session_log in place. Returns the chosen split (always "review")
+    so callers can tally progress without hardcoding the string themselves. Every
+    frame lands here unconditionally, regardless of detection confidence (including
+    frames with no detections at all, which get an empty label file) - this script
+    never decides a frame is good enough for train/val/test itself; only verify.py
+    promotes frames out of review/, as a deliberate human-in-the-loop step."""
     h_img, w_img = frame.shape[:2]
-    has_detections = len(confidences_in_frame) > 0
-    all_above_threshold = has_detections and all(c >= high_conf for c in confidences_in_frame)
-    any_below_threshold = has_detections and any(c < high_conf for c in confidences_in_frame)
-
-    if all_above_threshold:
-        chosen_split = random.choices(["train", "val", "test"], weights=[0.70, 0.20, 0.10])[0]
-        lines_to_write = yolo_lines
-    elif any_below_threshold:
-        chosen_split = "review"
-        lines_to_write = yolo_lines
-    else:
-        chosen_split = "review"
-        lines_to_write = []
+    chosen_split = "review"
 
     target_img_path = output_dir / chosen_split / "images" / f"{frame_id}.jpg"
     target_lbl_path = output_dir / chosen_split / "labels" / f"{frame_id}.txt"
@@ -135,14 +159,7 @@ def _route_and_save(
     )
     cv2.imwrite(str(target_img_path), resized_frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
     with target_lbl_path.open("w") as f:
-        f.writelines(lines_to_write)
-
-    # A frame promoted out of review/ leaves behind stale copies there - remove them.
-    prev = execution_log.get(frame_id)
-    if prev and prev["dataset_split"] == "review" and chosen_split in ("train", "val", "test"):
-        for old_path in (prev.get("image_path"), prev.get("label_path")):
-            if old_path and os.path.exists(old_path):
-                os.remove(old_path)
+        f.writelines(yolo_lines)
 
     execution_log[frame_id] = {
         "video_source": video_source,
@@ -154,6 +171,7 @@ def _route_and_save(
         "label_path": str(target_lbl_path),
     }
     session_log[frame_id] = chosen_split
+    return chosen_split
 
 
 def auto_label_video(
@@ -162,17 +180,18 @@ def auto_label_video(
     model_path: str | None = None,
     output_dir: str | Path = LABELED_DATA_DIR,
     crop_margin: float = DEFAULT_CROP_MARGIN,
-    high_conf: float = DEFAULT_HIGH_CONF,
     target_width: int = DEFAULT_TARGET_WIDTH,
     model=None,
 ) -> dict[str, str]:
     """Run YOLO detection restricted to the manually-labeled ROIs of each frame in
-    csv_path (a label_with_mouse.py output CSV), writing a YOLO-format dataset under
-    output_dir. Frames with no ROI in the CSV (no primary label and no extra objects)
-    are skipped entirely. Label coordinates are normalized to the full original frame,
-    not the cropped region used for inference. Returns the session log (frame_id ->
-    split) for frames processed in this call. Either model_path or a pre-loaded model
-    must be given.
+    csv_path (a label_with_mouse.py output CSV). Every processed frame lands in
+    output_dir/review/ unconditionally, regardless of detection confidence - see
+    _route_and_save. It's never train/val/test; nothing is auto-promoted there,
+    that's verify.py's job. Frames with no ROI in the CSV (no primary label and no
+    extra objects) are skipped entirely. Label coordinates are normalized to the full
+    original frame, not the cropped region used for inference. Returns the session
+    log (frame_id -> split) for frames processed in this call. Either model_path or a
+    pre-loaded model must be given.
     """
     if model is None:
         if not model_path:
@@ -192,9 +211,15 @@ def auto_label_video(
     if not rois_by_frame:
         print(f"No manually-labeled frames found in {csv_path}; nothing to auto-label.")
         return {}
+    print(f"Found {len(rois_by_frame)} labeled frame(s) in {csv_path}.")
 
     log_path = output_dir / "master_pipeline_log.json"
+    log_existed = log_path.exists()
     execution_log = _load_json(log_path)
+    if log_existed:
+        print(f"Resuming - {len(execution_log)} frame(s) already in master log, will skip finalized ones.")
+    else:
+        print("No existing master log found. Starting fresh.")
 
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     session_log: dict[str, str] = {}
@@ -204,8 +229,27 @@ def auto_label_video(
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
 
+    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    video_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    video_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    video_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"Opened video: {video_w}x{video_h} @ {video_fps:.1f}fps, {video_frame_count} frame(s) total.")
+
+    already_finalized = sum(
+        1 for idx in rois_by_frame
+        if execution_log.get(f"{video_name}_frame_{idx:06d}", {}).get("dataset_split") in ("train", "val", "test")
+    )
+    to_process = len(rois_by_frame) - already_finalized
+    print(f"Starting: {to_process} frame(s) queued for detection ({already_finalized} already finalized, will skip).")
+
     frame_idx = -1
     processed = 0
+    skipped_finalized = 0
+    skipped_no_roi = 0
+    has_label_count = 0
+    no_label_count = 0
+    split_counts: dict[str, int] = {"review": 0}
+    start_time = time.monotonic()
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -215,10 +259,12 @@ def auto_label_video(
         # frame_idx is 0-indexed to match label_with_mouse.py's CSV "frame" column.
         rois = rois_by_frame.get(frame_idx)
         if not rois:
+            skipped_no_roi += 1
             continue
 
         frame_id = f"{video_name}_frame_{frame_idx:06d}"
         if frame_id in execution_log and execution_log[frame_id]["dataset_split"] in ("train", "val", "test"):
+            skipped_finalized += 1
             continue
 
         h_img, w_img = frame.shape[:2]
@@ -247,7 +293,12 @@ def auto_label_video(
                 y_center = (fy1 + (fy2 - fy1) / 2) / h_img
                 yolo_lines.append(f"{cls} {x_center:.6f} {y_center:.6f} {box_w:.6f} {box_h:.6f}\n")
 
-        _route_and_save(
+        if yolo_lines:
+            has_label_count += 1
+        else:
+            no_label_count += 1
+
+        chosen_split = _route_and_save(
             frame=frame,
             frame_id=frame_id,
             video_source=str(video_path),
@@ -255,12 +306,14 @@ def auto_label_video(
             yolo_lines=yolo_lines,
             confidences_in_frame=confidences_in_frame,
             output_dir=output_dir,
-            high_conf=high_conf,
             target_width=target_width,
             execution_log=execution_log,
             session_log=session_log,
         )
+        split_counts[chosen_split] = split_counts.get(chosen_split, 0) + 1
         processed += 1
+        if processed % PROGRESS_INTERVAL == 0:
+            _log_progress(processed, to_process, split_counts, start_time)
 
     cap.release()
 
@@ -268,7 +321,12 @@ def auto_label_video(
     if session_log:
         _save_json(session_log_path, session_log)
 
-    print(f"Auto-labeled {processed} frame(s) from {video_name}.")
+    elapsed_total = time.monotonic() - start_time
+    print(
+        f"Auto-labeled {processed} frame(s) from {video_name} in {_format_duration(elapsed_total)} "
+        f"(skipped_finalized={skipped_finalized}, skipped_no_roi={skipped_no_roi})."
+    )
+    print(f"Labels: {has_label_count} frame(s) with at least one detection, {no_label_count} frame(s) with none.")
     print(f"Master log : {log_path} ({len(execution_log)} total frames)")
     if session_log:
         print(f"Session log: {session_log_path} ({len(session_log)} frames)")
@@ -277,19 +335,143 @@ def auto_label_video(
     return session_log
 
 
-def _batch_main(argv: list[str] | None = None) -> None:
-    """Standalone CLI: scan --data-root for videos and full-frame auto-label every
-    frame of every video (no manual ROI restriction) - the no-manual-intervention path."""
-    parser = argparse.ArgumentParser(
-        description="Batch auto-label every frame of every video under a data root (full-frame detection)."
-    )
-    parser.add_argument("--data-root", default=DEFAULT_DATA_ROOT, help="Folder to recursively search for videos.")
-    parser.add_argument("--output-dir", default=str(LABELED_DATA_DIR), help="Output dataset root.")
-    parser.add_argument("--model-path", required=True, help="Path to YOLO model weights.")
-    parser.add_argument("--high-conf", type=float, default=DEFAULT_HIGH_CONF)
-    parser.add_argument("--target-width", type=int, default=DEFAULT_TARGET_WIDTH)
-    args = parser.parse_args(argv)
+def _find_all_videos(data_root: Path) -> list[Path]:
+    """Recursively find every video file under data_root, any depth."""
+    return sorted(p for p in data_root.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS)
 
+
+def _find_video_by_stem(data_root: Path, stem: str) -> Path:
+    """Recursively search data_root for a video file whose name (minus extension)
+    exactly matches stem. Errors clearly if zero or more than one match is found,
+    rather than silently guessing."""
+    matches = [p for p in _find_all_videos(data_root) if p.stem == stem]
+    if not matches:
+        raise FileNotFoundError(f"No video named '{stem}.*' found under {data_root}")
+    if len(matches) > 1:
+        raise FileNotFoundError(
+            f"Multiple videos named '{stem}.*' found under {data_root} - pass the video "
+            f"path directly via auto_label_video() instead: " + ", ".join(str(m) for m in matches)
+        )
+    return matches[0]
+
+
+def _run_from_csv(csv_path: Path, args) -> None:
+    """Locate the video matching csv_path's name under --data-root, then run
+    ROI-restricted auto-labeling (auto_label_video) on that pair."""
+    video_path = _find_video_by_stem(Path(args.data_root), csv_path.stem)
+    print(f"Found video: {video_path}")
+
+    auto_label_video(
+        video_path=video_path,
+        csv_path=csv_path,
+        model_path=args.model_path,
+        output_dir=args.output_dir,
+        crop_margin=args.crop_margin,
+        target_width=args.target_width,
+    )
+
+
+def _label_video_full_frame(
+    video_path: Path,
+    model,
+    output_dir: Path,
+    target_width: int,
+    execution_log: dict,
+    session_log: dict,
+) -> dict:
+    """Run full-frame YOLO detection on every frame of video_path (no ROI restriction),
+    routing each through _route_and_save. Shared by both --data-root batch mode and
+    the single-video --video mode, so the loop only lives in one place. Returns a
+    stats dict for the caller to fold into its own summary."""
+    video_name = video_path.stem
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    video_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    video_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    video_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"  Opened: {video_w}x{video_h} @ {video_fps:.1f}fps, {video_frame_count} frame(s) total.")
+
+    frame_idx = -1
+    processed = 0
+    skipped_finalized = 0
+    has_label_count = 0
+    no_label_count = 0
+    split_counts: dict[str, int] = {"review": 0}
+    start_time = time.monotonic()
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frame_idx += 1
+
+        frame_id = f"{video_name}_frame_{frame_idx:06d}"
+        if frame_id in execution_log and execution_log[frame_id]["dataset_split"] in ("train", "val", "test"):
+            skipped_finalized += 1
+            continue
+
+        h_img, w_img = frame.shape[:2]
+        results = model(frame, verbose=False)[0]
+
+        yolo_lines = []
+        confidences_in_frame = []
+        for box in results.boxes:
+            conf = box.conf[0].item()
+            cls = int(box.cls[0].item())
+            confidences_in_frame.append(conf)
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            box_w = (x2 - x1) / w_img
+            box_h = (y2 - y1) / h_img
+            x_center = (x1 + (x2 - x1) / 2) / w_img
+            y_center = (y1 + (y2 - y1) / 2) / h_img
+            yolo_lines.append(f"{cls} {x_center:.6f} {y_center:.6f} {box_w:.6f} {box_h:.6f}\n")
+
+        if yolo_lines:
+            has_label_count += 1
+        else:
+            no_label_count += 1
+
+        chosen_split = _route_and_save(
+            frame=frame,
+            frame_id=frame_id,
+            video_source=str(video_path),
+            frame_number=frame_idx,
+            yolo_lines=yolo_lines,
+            confidences_in_frame=confidences_in_frame,
+            output_dir=output_dir,
+            target_width=target_width,
+            execution_log=execution_log,
+            session_log=session_log,
+        )
+        split_counts[chosen_split] = split_counts.get(chosen_split, 0) + 1
+        processed += 1
+        if processed % PROGRESS_INTERVAL == 0:
+            # total is an estimate (video_frame_count minus finalized-skips so far,
+            # which only grows) - good enough for a progress percentage/ETA, not exact.
+            _log_progress(processed, max(processed, video_frame_count - skipped_finalized), split_counts, start_time)
+
+    cap.release()
+    elapsed_total = time.monotonic() - start_time
+    print(
+        f"  Finished {video_name} in {_format_duration(elapsed_total)}: {processed} processed, "
+        f"{skipped_finalized} already finalized skipped. Log now has {len(execution_log)} total frame(s)."
+    )
+    print(f"  Labels: {has_label_count} frame(s) with at least one detection, {no_label_count} frame(s) with none.")
+
+    return {
+        "processed": processed,
+        "skipped_finalized": skipped_finalized,
+        "has_label_count": has_label_count,
+        "no_label_count": no_label_count,
+        "split_counts": split_counts,
+    }
+
+
+def _run_single_video(video_path: Path, args) -> None:
+    """Full-frame mode on exactly one video (no ROI/CSV restriction) - the --video path."""
     from ultralytics import YOLO
 
     output_dir = Path(args.output_dir)
@@ -298,67 +480,79 @@ def _batch_main(argv: list[str] | None = None) -> None:
     print(f"Loading model weights from {args.model_path}...")
     model = YOLO(args.model_path)
 
-    video_paths = []
-    for ext in ("*.MP4", "*.mp4", "*.avi", "*.mkv"):
-        video_paths.extend(glob.glob(os.path.join(args.data_root, "**", ext), recursive=True))
-    print(f"Found {len(video_paths)} videos to process.")
-
     log_path = output_dir / "master_pipeline_log.json"
+    log_existed = log_path.exists()
     execution_log = _load_json(log_path)
+    if log_existed:
+        print(f"Resuming - {len(execution_log)} frame(s) already in master log, will skip finalized ones.")
+    else:
+        print("No existing master log found. Starting fresh.")
 
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     session_log: dict[str, str] = {}
     session_log_path = output_dir / f"session_{session_id}.json"
 
+    print(f"Processing {video_path.stem} (full-frame, no ROI restriction)...")
+    _label_video_full_frame(
+        video_path=video_path,
+        model=model,
+        output_dir=output_dir,
+        target_width=args.target_width,
+        execution_log=execution_log,
+        session_log=session_log,
+    )
+
+    _save_json(log_path, execution_log)
+    if session_log:
+        _save_json(session_log_path, session_log)
+
+    print(f"Master log : {log_path} ({len(execution_log)} total frames)")
+    if session_log:
+        print(f"Session log: {session_log_path} ({len(session_log)} frames)")
+        print(f"To verify only new frames: python3 verify.py --session {session_log_path}")
+
+
+def _run_batch(args) -> None:
+    """Full-frame batch mode: scan --data-root for videos and auto-label every frame
+    of every video (no manual ROI restriction) - the no-manual-intervention path."""
+    from ultralytics import YOLO
+
+    output_dir = Path(args.output_dir)
+    _ensure_split_dirs(output_dir)
+
+    print(f"Loading model weights from {args.model_path}...")
+    model = YOLO(args.model_path)
+
+    video_paths = _find_all_videos(Path(args.data_root))
+    print(f"Found {len(video_paths)} video(s) to process under {args.data_root}.")
+
+    log_path = output_dir / "master_pipeline_log.json"
+    log_existed = log_path.exists()
+    execution_log = _load_json(log_path)
+    if log_existed:
+        print(f"Resuming - {len(execution_log)} frame(s) already in master log, will skip finalized ones.")
+    else:
+        print("No existing master log found. Starting fresh.")
+
+    session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_log: dict[str, str] = {}
+    session_log_path = output_dir / f"session_{session_id}.json"
+
+    total_has_label = 0
+    total_no_label = 0
+
     for v_idx, video_path in enumerate(video_paths):
-        video_name = os.path.splitext(os.path.basename(video_path))[0]
-        print(f"\n[{v_idx + 1}/{len(video_paths)}] Processing Stream: {video_name}")
-
-        cap = cv2.VideoCapture(video_path)
-        frame_idx = -1
-
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            frame_idx += 1
-
-            frame_id = f"{video_name}_frame_{frame_idx:06d}"
-            if frame_id in execution_log and execution_log[frame_id]["dataset_split"] in ("train", "val", "test"):
-                continue
-
-            h_img, w_img = frame.shape[:2]
-            results = model(frame, verbose=False)[0]
-
-            yolo_lines = []
-            confidences_in_frame = []
-            for box in results.boxes:
-                conf = box.conf[0].item()
-                cls = int(box.cls[0].item())
-                confidences_in_frame.append(conf)
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                box_w = (x2 - x1) / w_img
-                box_h = (y2 - y1) / h_img
-                x_center = (x1 + (x2 - x1) / 2) / w_img
-                y_center = (y1 + (y2 - y1) / 2) / h_img
-                yolo_lines.append(f"{cls} {x_center:.6f} {y_center:.6f} {box_w:.6f} {box_h:.6f}\n")
-
-            _route_and_save(
-                frame=frame,
-                frame_id=frame_id,
-                video_source=video_path,
-                frame_number=frame_idx,
-                yolo_lines=yolo_lines,
-                confidences_in_frame=confidences_in_frame,
-                output_dir=output_dir,
-                high_conf=args.high_conf,
-                target_width=args.target_width,
-                execution_log=execution_log,
-                session_log=session_log,
-            )
-
-        cap.release()
-        print(f"Finished parsing video. Current total logged records: {len(execution_log)}")
+        print(f"\n[{v_idx + 1}/{len(video_paths)}] Processing Stream: {video_path.stem}")
+        stats = _label_video_full_frame(
+            video_path=video_path,
+            model=model,
+            output_dir=output_dir,
+            target_width=args.target_width,
+            execution_log=execution_log,
+            session_log=session_log,
+        )
+        total_has_label += stats["has_label_count"]
+        total_no_label += stats["no_label_count"]
 
     _save_json(log_path, execution_log)
     _save_json(session_log_path, session_log)
@@ -366,8 +560,55 @@ def _batch_main(argv: list[str] | None = None) -> None:
     print("\nProcess complete.")
     print(f"  Master log : {log_path}  ({len(execution_log)} total frames)")
     print(f"  Session log: {session_log_path}  ({len(session_log)} frames added this run)")
-    print(f"  To verify only new frames:  python3 verify.py --session {session_log_path}")
+    print(f"  Labels: {total_has_label} frame(s) with at least one detection, {total_no_label} frame(s) with none.")
+
+
+def _cli_main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Auto-label videos into a YOLO-format dataset - full-frame batch mode by "
+                     "default (--data-root) or on one video (--video), or ROI-restricted for "
+                     "a single video via --csv."
+    )
+    parser.add_argument("--data-root", default=DEFAULT_DATA_ROOT, help="Folder to recursively search for videos.")
+    parser.add_argument("--output-dir", default=str(LABELED_DATA_DIR), help="Output dataset root.")
+    parser.add_argument("--model-path", required=True, help="Path to YOLO model weights.")
+    parser.add_argument("--target-width", type=int, default=DEFAULT_TARGET_WIDTH)
+    parser.add_argument(
+        "--csv", type=str, default=None,
+        help="Run ROI-restricted auto-labeling on a single video, driven by this "
+             "label_with_mouse.py CSV (e.g. output/manual_labels/video.csv). The video is "
+             "located by recursively searching --data-root for a file whose name (minus "
+             "extension) matches the CSV's. Mutually exclusive with --video. If neither is "
+             "given, falls back to full-frame batch mode over every video under --data-root.",
+    )
+    parser.add_argument(
+        "--video", type=str, default=None,
+        help="Run full-frame detection (no ROI/CSV restriction) on exactly this one video "
+             "file, instead of scanning --data-root or using a CSV. Mutually exclusive with --csv.",
+    )
+    parser.add_argument(
+        "--crop-margin", type=float, default=DEFAULT_CROP_MARGIN,
+        help=f"Only used with --csv: padding added around each manually-labeled box before "
+             f"detection, as a fraction of the box's own width/height (default: {DEFAULT_CROP_MARGIN}).",
+    )
+    args = parser.parse_args(argv)
+
+    if args.csv and args.video:
+        parser.error("--csv and --video are mutually exclusive")
+
+    if args.csv:
+        csv_path = Path(args.csv)
+        if not csv_path.is_file():
+            parser.error(f"CSV not found: {csv_path}")
+        _run_from_csv(csv_path, args)
+    elif args.video:
+        video_path = Path(args.video)
+        if not video_path.is_file():
+            parser.error(f"Video not found: {video_path}")
+        _run_single_video(video_path, args)
+    else:
+        _run_batch(args)
 
 
 if __name__ == "__main__":
-    _batch_main()
+    _cli_main()
