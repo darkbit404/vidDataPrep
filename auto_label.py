@@ -28,7 +28,7 @@ master_pipeline_log.json), so results accumulate across videos and across modes.
 Every frame this script processes lands in labeled_data/review/ unconditionally -
 confidence plays no role in where a frame goes, and this script never auto-promotes
 a frame into train/val/test itself. Promotion out of review/ is a human-in-the-loop
-step done separately with verify.py.
+step done separately with reviewer.py.
 """
 
 from __future__ import annotations
@@ -145,7 +145,7 @@ def _route_and_save(
     so callers can tally progress without hardcoding the string themselves. Every
     frame lands here unconditionally, regardless of detection confidence (including
     frames with no detections at all, which get an empty label file) - this script
-    never decides a frame is good enough for train/val/test itself; only verify.py
+    never decides a frame is good enough for train/val/test itself; only reviewer.py
     promotes frames out of review/, as a deliberate human-in-the-loop step."""
     h_img, w_img = frame.shape[:2]
     chosen_split = "review"
@@ -187,7 +187,7 @@ def auto_label_video(
     csv_path (a label_with_mouse.py output CSV). Every processed frame lands in
     output_dir/review/ unconditionally, regardless of detection confidence - see
     _route_and_save. It's never train/val/test; nothing is auto-promoted there,
-    that's verify.py's job. Frames with no ROI in the CSV (no primary label and no
+    that's reviewer.py's job. Frames with no ROI in the CSV (no primary label and no
     extra objects) are skipped entirely. Label coordinates are normalized to the full
     original frame, not the cropped region used for inference. Returns the session
     log (frame_id -> split) for frames processed in this call. Either model_path or a
@@ -330,12 +330,12 @@ def auto_label_video(
     print(f"Master log : {log_path} ({len(execution_log)} total frames)")
     if session_log:
         print(f"Session log: {session_log_path} ({len(session_log)} frames)")
-        print(f"To verify only new frames: python3 verify.py --session {session_log_path}")
+        print(f"To review: python3 reviewer.py")
 
     return session_log
 
 
-def _find_all_videos(data_root: Path) -> list[Path]:
+def find_all_videos(data_root: Path) -> list[Path]:
     """Recursively find every video file under data_root, any depth."""
     return sorted(p for p in data_root.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS)
 
@@ -344,7 +344,7 @@ def _find_video_by_stem(data_root: Path, stem: str) -> Path:
     """Recursively search data_root for a video file whose name (minus extension)
     exactly matches stem. Errors clearly if zero or more than one match is found,
     rather than silently guessing."""
-    matches = [p for p in _find_all_videos(data_root) if p.stem == stem]
+    matches = [p for p in find_all_videos(data_root) if p.stem == stem]
     if not matches:
         raise FileNotFoundError(f"No video named '{stem}.*' found under {data_root}")
     if len(matches) > 1:
@@ -470,61 +470,36 @@ def _label_video_full_frame(
     }
 
 
-def _run_single_video(video_path: Path, args) -> None:
-    """Full-frame mode on exactly one video (no ROI/CSV restriction) - the --video path."""
-    from ultralytics import YOLO
+def auto_label_full_frame(
+    video_path: str | Path | None = None,
+    data_root: str | Path = DEFAULT_DATA_ROOT,
+    model_path: str | None = None,
+    output_dir: str | Path = LABELED_DATA_DIR,
+    target_width: int = DEFAULT_TARGET_WIDTH,
+    model=None,
+) -> dict[str, str]:
+    """Full-frame YOLO detection, no ROI/CSV restriction - the no-manual-intervention
+    path. Labels exactly one video if video_path is given, otherwise every video found
+    recursively under data_root (see find_all_videos). Every processed frame lands in
+    output_dir/review/ unconditionally (see _route_and_save); nothing is auto-promoted
+    to train/val/test here, that's reviewer.py's job. Returns the session log (frame_id
+    -> split) for frames processed in this call. Either model_path or a pre-loaded
+    model must be given."""
+    if model is None:
+        if not model_path:
+            raise ValueError("auto_label_full_frame requires either model_path or a pre-loaded model")
+        from ultralytics import YOLO
+        print(f"Loading model weights from {model_path}...")
+        model = YOLO(model_path)
 
-    output_dir = Path(args.output_dir)
+    output_dir = Path(output_dir)
     _ensure_split_dirs(output_dir)
 
-    print(f"Loading model weights from {args.model_path}...")
-    model = YOLO(args.model_path)
-
-    log_path = output_dir / "master_pipeline_log.json"
-    log_existed = log_path.exists()
-    execution_log = _load_json(log_path)
-    if log_existed:
-        print(f"Resuming - {len(execution_log)} frame(s) already in master log, will skip finalized ones.")
+    if video_path is not None:
+        video_paths = [Path(video_path)]
     else:
-        print("No existing master log found. Starting fresh.")
-
-    session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    session_log: dict[str, str] = {}
-    session_log_path = output_dir / f"session_{session_id}.json"
-
-    print(f"Processing {video_path.stem} (full-frame, no ROI restriction)...")
-    _label_video_full_frame(
-        video_path=video_path,
-        model=model,
-        output_dir=output_dir,
-        target_width=args.target_width,
-        execution_log=execution_log,
-        session_log=session_log,
-    )
-
-    _save_json(log_path, execution_log)
-    if session_log:
-        _save_json(session_log_path, session_log)
-
-    print(f"Master log : {log_path} ({len(execution_log)} total frames)")
-    if session_log:
-        print(f"Session log: {session_log_path} ({len(session_log)} frames)")
-        print(f"To verify only new frames: python3 verify.py --session {session_log_path}")
-
-
-def _run_batch(args) -> None:
-    """Full-frame batch mode: scan --data-root for videos and auto-label every frame
-    of every video (no manual ROI restriction) - the no-manual-intervention path."""
-    from ultralytics import YOLO
-
-    output_dir = Path(args.output_dir)
-    _ensure_split_dirs(output_dir)
-
-    print(f"Loading model weights from {args.model_path}...")
-    model = YOLO(args.model_path)
-
-    video_paths = _find_all_videos(Path(args.data_root))
-    print(f"Found {len(video_paths)} video(s) to process under {args.data_root}.")
+        video_paths = find_all_videos(Path(data_root))
+        print(f"Found {len(video_paths)} video(s) to process under {data_root}.")
 
     log_path = output_dir / "master_pipeline_log.json"
     log_existed = log_path.exists()
@@ -541,13 +516,13 @@ def _run_batch(args) -> None:
     total_has_label = 0
     total_no_label = 0
 
-    for v_idx, video_path in enumerate(video_paths):
-        print(f"\n[{v_idx + 1}/{len(video_paths)}] Processing Stream: {video_path.stem}")
+    for v_idx, vp in enumerate(video_paths):
+        print(f"\n[{v_idx + 1}/{len(video_paths)}] Processing: {vp.stem}")
         stats = _label_video_full_frame(
-            video_path=video_path,
+            video_path=vp,
             model=model,
             output_dir=output_dir,
-            target_width=args.target_width,
+            target_width=target_width,
             execution_log=execution_log,
             session_log=session_log,
         )
@@ -555,12 +530,18 @@ def _run_batch(args) -> None:
         total_no_label += stats["no_label_count"]
 
     _save_json(log_path, execution_log)
-    _save_json(session_log_path, session_log)
+    if session_log:
+        _save_json(session_log_path, session_log)
 
     print("\nProcess complete.")
     print(f"  Master log : {log_path}  ({len(execution_log)} total frames)")
-    print(f"  Session log: {session_log_path}  ({len(session_log)} frames added this run)")
+    if session_log:
+        print(f"  Session log: {session_log_path}  ({len(session_log)} frames added this run)")
     print(f"  Labels: {total_has_label} frame(s) with at least one detection, {total_no_label} frame(s) with none.")
+    if session_log:
+        print(f"  To review: python3 reviewer.py")
+
+    return session_log
 
 
 def _cli_main(argv: list[str] | None = None) -> None:
@@ -605,9 +586,19 @@ def _cli_main(argv: list[str] | None = None) -> None:
         video_path = Path(args.video)
         if not video_path.is_file():
             parser.error(f"Video not found: {video_path}")
-        _run_single_video(video_path, args)
+        auto_label_full_frame(
+            video_path=video_path,
+            model_path=args.model_path,
+            output_dir=args.output_dir,
+            target_width=args.target_width,
+        )
     else:
-        _run_batch(args)
+        auto_label_full_frame(
+            data_root=args.data_root,
+            model_path=args.model_path,
+            output_dir=args.output_dir,
+            target_width=args.target_width,
+        )
 
 
 if __name__ == "__main__":
