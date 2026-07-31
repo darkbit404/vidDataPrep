@@ -24,6 +24,7 @@ review() is also importable and callable directly - e.g. from main.py's
 """
 
 import os
+import json
 import shutil
 import bisect
 import argparse
@@ -51,12 +52,17 @@ import cv2
 DEFAULT_REVIEW_DIR = Path(__file__).resolve().parent / "output" / "labeled_data" / "review"
 
 
-def review(review_folder=None, cls: int = 0, video: str | None = None) -> None:
+def review(review_folder=None, cls: int = 0, video: str | None = None, restart: bool = False) -> None:
     """Interactively review a images/+labels/ pool (default: output/labeled_data/review/),
     optionally filtered to one video's frames (see module docstring for controls).
     Blocks until the user quits (q/Esc); a no-op (prints and returns) if the folder
     doesn't exist or has no frames, so callers chaining this after auto-labeling don't
-    crash the whole pipeline run on an empty pool."""
+    crash the whole pipeline run on an empty pool.
+
+    Progress (the last-viewed frame) is persisted to a small state file in
+    review_folder and auto-resumed on the next call/run, so a session that gets
+    interrupted (or just closed) doesn't force a re-scroll through everything
+    already seen. Pass restart=True to ignore any saved state and start at frame 0."""
     review_folder = str(review_folder) if review_folder is not None else str(DEFAULT_REVIEW_DIR)
     img_dir = os.path.join(review_folder, "images")
     lbl_dir = os.path.join(review_folder, "labels")
@@ -83,6 +89,31 @@ def review(review_folder=None, cls: int = 0, video: str | None = None) -> None:
         where = f" for video '{video}'" if video else ""
         print(f"No .jpg frames found{where} in {img_dir}")
         return
+
+    # ── Resume state ─────────────────────────────────────────────────────────
+    # Namespaced by video filter so a --video session and a full-pool session
+    # (different frame lists) don't clobber each other's progress.
+    state_suffix = f"__{video}" if video else ""
+    state_path = os.path.join(review_folder, f".review_state{state_suffix}.json")
+
+    def save_state(fname):
+        try:
+            with open(state_path, "w") as f:
+                json.dump({"last_frame": fname}, f)
+        except OSError:
+            pass
+
+    def load_resume_idx():
+        if restart or not os.path.exists(state_path):
+            return 0
+        try:
+            with open(state_path) as f:
+                last_frame = json.load(f).get("last_frame")
+        except (OSError, json.JSONDecodeError):
+            return 0
+        if last_frame in frames:
+            return frames.index(last_frame)
+        return 0
 
     video_note = f" (video={video})" if video else ""
     print(f"Loaded {len(frames)} frames from {img_dir}{video_note}")
@@ -233,7 +264,9 @@ def review(review_folder=None, cls: int = 0, video: str | None = None) -> None:
     win = "Review -- " + win_label   # ASCII only
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
-    idx = 0
+    idx = load_resume_idx()
+    if idx:
+        print(f"Resuming at frame {idx+1}/{len(frames)}: {frames[idx]}")
     while True:
         current_idx = idx
         fname = frames[idx]
@@ -254,11 +287,14 @@ def review(review_folder=None, cls: int = 0, video: str | None = None) -> None:
         key = cv2.waitKey(delay) & 0xFF
 
         if key in (ord('q'), 27):
+            save_state(frames[idx])
             break
         elif key in (ord(' '), ord('d'), ord('D'), 83):   # next
             idx = min(idx + 1, len(frames) - 1)
+            save_state(frames[idx])
         elif key in (ord('a'), ord('A'), 81):             # back
             idx = max(idx - 1, 0)
+            save_state(frames[idx])
         elif key in (ord('c'), ord('C')):                 # clear
             push_label_undo(fname)
             write_label(fname, "")
@@ -269,6 +305,7 @@ def review(review_folder=None, cls: int = 0, video: str | None = None) -> None:
                 print("All frames junked - nothing left to review.")
                 break
             idx = min(idx, len(frames) - 1)
+            save_state(frames[idx])
             continue
         elif key in (ord('u'), ord('U')):                 # undo
             if undo_stack:
@@ -278,11 +315,13 @@ def review(review_folder=None, cls: int = 0, video: str | None = None) -> None:
                     write_label(pf, pc)
                     if pf in frames:
                         idx = frames.index(pf)
+                        save_state(frames[idx])
                     print(f"  Undo: restored label for {pf}")
                 else:  # ("remove", pf)
                     _, pf = action
                     undo_remove(pf)
                     idx = frames.index(pf)
+                    save_state(frames[idx])
                     print(f"  Undo: restored {pf} from junk")
             else:
                 print("  Nothing to undo.")
@@ -298,8 +337,10 @@ def _cli_main():
     parser.add_argument("--class", dest="cls", type=int, default=0, help="Class index for drawn boxes (default 0)")
     parser.add_argument("--video", dest="video", default=None,
                          help="Only review frames whose filename starts with '<video>_frame_'")
+    parser.add_argument("--restart", action="store_true",
+                         help="Ignore any saved resume state and start over from frame 0")
     args = parser.parse_args()
-    review(review_folder=args.review_folder, cls=args.cls, video=args.video)
+    review(review_folder=args.review_folder, cls=args.cls, video=args.video, restart=args.restart)
 
 
 if __name__ == "__main__":
